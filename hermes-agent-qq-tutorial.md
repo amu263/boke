@@ -50,6 +50,78 @@
 
 ---
 
+## 🐳 第零步：部署 Hermes Agent（Docker）
+
+Hermes Agent 是整个系统的大脑，负责调用大模型干活。
+
+### 0.1 克隆代码
+
+```bash
+git clone https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+```
+
+### 0.2 启动容器
+
+```bash
+HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+```
+
+两个服务：
+
+| 服务 | 端口 | 作用 |
+|------|------|------|
+| `hermes` (gateway) | `:8642` | API + 消息网关 |
+| `hermes-dashboard` | `:9119` | Web 面板 |
+
+> 用 `network_mode: host`，容器共享宿主机网络。
+
+### 0.3 配置模型和 API Key
+
+```bash
+docker exec -it hermes hermes setup
+```
+
+或编辑 `~/.hermes/config.yaml`：
+
+```yaml
+model:
+  default: "deepseek-v4-pro"
+  provider: "deepseek"
+
+gateway:
+  api_key: "你自定义的密钥"   # NoneBot2 用这个调用 API
+```
+
+### 0.4 暴露 API（如果 NoneBot2 在另一容器）
+
+`docker-compose.yml` 取消注释：
+
+```yaml
+- API_SERVER_HOST=0.0.0.0
+- API_SERVER_KEY=你的密钥
+```
+
+重启：`docker compose restart`
+
+### 0.5 验证
+
+```bash
+docker exec hermes curl -s http://127.0.0.1:8642/v1/health
+# → {"status":"ok"}
+```
+
+### 0.6 常用命令
+
+```bash
+docker logs -f hermes        # 看日志
+docker exec -it hermes bash  # 进容器
+docker compose restart       # 重启
+docker compose down          # 停止
+```
+
+---
+
 ## 🚀 第一步：安装 NapCat（宿主机）
 
 NapCat 是 QQ 机器人的"驱动程序"，它通过 WebSocket 把你的 QQ 号变成可编程接口。
@@ -87,6 +159,37 @@ URL：ws://172.17.0.5:8080/onebot/v11/ws
 - ✅ WebSocket 服务端
 
 保存后 NapCat 会尝试连接，此时还没人接——等后面 NoneBot2 跑起来就好了。
+
+### 1.4 登录 QQ 与查看令牌
+
+如果你用的是扫码登录，NapCat WebUI 首页会显示一个二维码。用机器人 QQ 号扫码登录即可。
+
+**查看登录令牌（Token）**：
+
+登录成功后，令牌保存在容器内的配置文件中。两种方式查看：
+
+**方式一：通过 WebUI（推荐）**
+
+打开 `http://你的IP:6099/webui` → **网络配置**，在 HTTP 服务配置里能看到 `access_token`（用于 NoneBot / HTTP API 调用）。
+
+**方式二：命令行**
+
+```bash
+# 进入 NapCat 容器
+docker exec -it napcat sh
+
+# 令牌在 onebot11 配置里
+cat /app/napcat/config/onebot11_你的QQ号.json | grep token
+```
+
+**方式三：宿主机直接看**
+
+```bash
+# 因为你映射了配置目录
+cat ~/napcat/config/onebot11_*.json | grep token
+```
+
+> 💡 这个 token 是 NapCat HTTP API 的认证令牌，如果你需要通过 HTTP（而非 WebSocket）调用 NapCat API，就需要它。NoneBot2 用的是 WebSocket 方式，一般不需要这个 token。
 
 ---
 
