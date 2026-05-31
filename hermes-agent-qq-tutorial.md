@@ -397,124 +397,350 @@ tree /opt/data/qq-bot
 
 ---
 
-## 🧠 第四步：编写桥接插件（核心）
+## 🧠 第四步：编写桥接插件（完整代码）
 
-这是整个项目的灵魂——`plugins/hermes_bridge.py`。
+这是整个项目的灵魂——`plugins/hermes_bridge.py`。把以下完整代码复制粘贴即可：
 
-> 完整的生产级代码在 [GitHub](#)，以下按功能模块讲解。
-
-### 4.1 基础骨架
-
-```python
-import os, re, time, httpx, asyncio
+```bash
+cat > plugins/hermes_bridge.py << 'PYEOF'
+import os, re, time, json, httpx, asyncio
+from pathlib import Path
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
+from nonebot.log import logger
 
-# ── 读取配置 ──
-HERMES_API_URL = os.getenv("HERMES_API_URL",
-    "http://127.0.0.1:8642/v1/chat/completions")
-HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+# ── Config ────────────────────────────────────────────────────────
+HERMES_API_URL=os.getenv("HERMES_API_URL","http://127.0.0.1:8642/v1/chat/completions")
+HERMES_API_KEY=os.getenv("HERMES_API_KEY","")
+ALLOWED_GROUPS={g.strip() for g in os.getenv("HERMES_QQ_ALLOWED_GROUPS","").split(",") if g.strip()}
+BOT_QQ=os.getenv("HERMES_QQ_BOT_QQ","")
+ADMIN_QQ=os.getenv("HERMES_QQ_ADMIN_QQ","")
+IMAGE_ONLY_ON_IMAGE_PROMPT=os.getenv("HERMES_QQ_IMAGE_ONLY_ON_IMAGE_PROMPT","true").lower() in {"1","true","yes","on"}
+SYSTEM_PROMPT_FILE=os.getenv("HERMES_QQ_SYSTEM_PROMPT_PATH","/opt/data/qq-bot/prompts/niku.txt")
 
-# 如果 .env 里没设 API Key，从 Hermes 配置里读
 if not HERMES_API_KEY:
     import yaml
-    with open("/opt/data/config.yaml") as f:
-        HERMES_API_KEY = yaml.safe_load(f)["gateway"]["api_key"]
+    try:
+        with open("/opt/data/config.yaml") as f:
+            HERMES_API_KEY=yaml.safe_load(f).get("gateway",{}).get("api_key","")
+    except: pass
 
-# ── 消息匹配 ──
-matcher = on_message(priority=1, block=False)
-```
+# ── State ──────────────────────────────────────────────────────────
+STATE_DIR=Path("/opt/data/qq-bot/state")
+STATE_DIR.mkdir(parents=True,exist_ok=True)
+_last_image_url: str|None = None
+_last_trigger: dict[str,float] = {}
+COOLDOWN_GROUP_S=3
+COOLDOWN_USER_S=10
+MAX_HISTORY_STORE=100   # 本地最多存多少条消息（user+assistant 各算 1 条）
+RECENT_WINDOW=20         # 发给 Hermes 时保留最近多少条原文
+SUMMARY_TRIGGER=10       # 新消息积累这么多条后重新生成摘要
 
-### 4.2 提取 @消息
+# 群聊对话历史
+_chat_history: dict[str, list[dict]] = {}
+# 群聊摘要缓存
+_chat_summary: dict[str, tuple[str,int]] = {}
 
-QQ 的 @消息有特殊格式 `[CQ:at,qq=机器人QQ]`，需要手工提取：
+# ── Regex ─────────────────────────────────────────────────────────
+IMAGE_PROMPT_RE=re.compile(r"(画图|画个|画一张|帮我画|给我画|绘图|生图|生成图|生成图片|出图|做图|作图|image\s*gen|generate\s+image)",re.I)
+IMAGE_URL_RE=re.compile(r"https?://\S+?\.(?:png|jpg|jpeg|webp)(?:\?\S+)?",re.I)
 
-```python
-def extract_prompt(event, self_id: str) -> str | None:
-    raw = event.raw_message  # ⚠️ 用 raw_message，不能用 str(event.message)
-    self_at = f"[CQ:at,qq={self_id}]"
-    if self_at not in raw:
-        return None  # 没人 @机器人，忽略
-    text = raw.replace(self_at, "").strip()
-    return text or None
-```
+matcher=on_message(priority=1,block=False)
 
-### 4.3 调用 Hermes API
 
-```python
-async def ask_hermes(prompt: str, group_id: str) -> str:
-    headers = {"Authorization": f"Bearer {HERMES_API_KEY}"}
-    payload = {
-        "model": "default",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
+# ═══════════════════════════════════════════════════════════════════
+#  Utility
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_prompt(event: GroupMessageEvent, self_id: str) -> str|None:
+    raw=event.raw_message or str(event.message)
+    self_at=f"[CQ:at,qq={self_id}]"
+    if self_at not in raw: return None
+    text=raw.replace(self_at,"").replace(f"[at:qq={self_id}]","").strip()
+    return " ".join(text.split()) or None
+
+def plain_qq_text(text: str) -> str:
+    text=re.sub(r"```[\s\S]*?```","[代码块略]",text)
+    text=re.sub(r"\*\*(.*?)\*\*",r"\1",text)
+    text=re.sub(r"`([^`]+)`",r"\1",text)
+    return text.strip()
+
+def is_admin(user_id: str) -> bool:
+    return bool(ADMIN_QQ) and str(user_id)==ADMIN_QQ
+
+def check_cooldown(group_id: str, user_id: str) -> str|None:
+    now=time.time()
+    gk=f"group:{group_id}"; uk=f"user:{group_id}:{user_id}"
+    if gk in _last_trigger and (now-_last_trigger[gk])<COOLDOWN_GROUP_S:
+        return "⏳ 群聊冷却中，请稍候..."
+    if uk in _last_trigger and (now-_last_trigger[uk])<COOLDOWN_USER_S:
+        return f"⏳ 冷却中，{int(COOLDOWN_USER_S-(now-_last_trigger[uk]))}秒后再试"
+    _last_trigger[gk]=now; _last_trigger[uk]=now
+    return None
+
+def is_image_prompt(prompt: str) -> bool:
+    return bool(IMAGE_PROMPT_RE.search(prompt or ""))
+
+def first_image_url(text: str) -> str|None:
+    m=IMAGE_URL_RE.search(text or "")
+    return m.group(0) if m else None
+
+async def send_chunks(bot: Bot, event: GroupMessageEvent, text: str, chunk_size: int=1800):
+    """Split long messages into chunks."""
+    reply=MessageSegment.reply(event.message_id)
+    for i in range(0,len(text),chunk_size):
+        chunk=text[i:i+chunk_size]
+        if i==0:
+            await bot.send(event, reply+chunk)
+        else:
+            await bot.send(event, chunk)
+        await asyncio.sleep(0.5)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Hermes API
+# ═══════════════════════════════════════════════════════════════════
+
+def _system_prompt() -> str:
+    try:
+        return Path(SYSTEM_PROMPT_FILE).read_text().strip()
+    except:
+        return "你正在 QQ 群里和用户对话。默认中文，简洁实用。尽量控制在300字以内。"
+
+
+async def _maybe_summarize(group_id: str, history: list[dict], force: bool=False):
+    """当旧消息积累到阈值时，生成/更新对话摘要（压缩 early history）。"""
+    total=len(history)
+    old_count=total-RECENT_WINDOW
+    if old_count<=0:
+        return
+    prev=_chat_summary.get(group_id)
+    prev_count=prev[1] if prev else 0
+    if not force and prev_count>0 and (old_count-prev_count)<SUMMARY_TRIGGER:
+        return
+    chunk=history[:old_count]
+    lines=[]
+    for m in chunk:
+        role="用户" if m["role"]=="user" else "助手"
+        text=m["content"][:200]
+        lines.append(f"[{role}] {text}")
+    body="\n".join(lines)
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            hdrs={}
+            if HERMES_API_KEY:
+                hdrs["Authorization"]=f"Bearer {HERMES_API_KEY}"
+            r=await client.post(HERMES_API_URL,headers=hdrs,json={
+                "model":"default","stream":False,
+                "messages":[
+                    {"role":"system","content":"你是对话摘要助手。把以下群聊对话压缩成一段简洁摘要（≤500字），保留关键信息：讨论了什么话题、做了哪些决策、有什么结论。不要逐条复述。"},
+                    {"role":"user","content":body},
+                ],
+            })
+            r.raise_for_status()
+            summary=r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        summary=f"[早期对话摘要: 共{old_count}条消息]"
+    _chat_summary[group_id]=(summary, old_count)
+
+
+async def ask_hermes(prompt: str, group_id: str, retries: int=2) -> str:
+    headers={}
+    if HERMES_API_KEY:
+        headers["Authorization"]=f"Bearer {HERMES_API_KEY}"
+
+    if group_id not in _chat_history:
+        _chat_history[group_id]=[]
+    history=_chat_history[group_id]
+
+    # 构建智能消息队列
+    total=len(history)
+    recent=history[-RECENT_WINDOW:] if total>RECENT_WINDOW else history
+    old=history[:-RECENT_WINDOW] if total>RECENT_WINDOW else []
+
+    # 只在新消息积累到阈值时才重新摘要
+    await _maybe_summarize(group_id, history)
+
+    messages=[{"role":"system","content":_system_prompt()}]
+
+    # 如果有旧消息，注入压缩摘要
+    if old:
+        summary_info=_chat_summary.get(group_id)
+        if summary_info:
+            messages.append({"role":"system","content":f"[以下是更早的对话摘要]\n{summary_info[0]}"})
+
+    messages.extend(recent)
+    messages.append({"role":"user","content":prompt})
+
+    payload={
+        "model":"default",
+        "messages":messages,
+        "stream":False,
     }
-    async with httpx.AsyncClient(timeout=7200) as client:
-        r = await client.post(HERMES_API_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-```
 
-> ⚠️ `timeout=7200` 是 2 小时——部署类长任务不会超时断连。
+    last_err=None
+    for attempt in range(retries+1):
+        try:
+            async with httpx.AsyncClient(timeout=7200) as client:
+                r=await client.post(HERMES_API_URL,headers=headers,json=payload)
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_err=e
+            if attempt<retries:
+                await asyncio.sleep(2)
+    raise last_err or RuntimeError("Hermes call failed")
 
-### 4.4 主消息处理
 
-```python
+# ═══════════════════════════════════════════════════════════════════
+#  Admin Commands
+# ═══════════════════════════════════════════════════════════════════
+
+ADMIN_COMMANDS={
+    "状态": lambda group_id=None: _cmd_status(group_id),
+    "status": lambda group_id=None: _cmd_status(group_id),
+    "查图": lambda: _cmd_lastimg(),
+    "lastimg": lambda: _cmd_lastimg(),
+    "帮助": lambda: _cmd_help(),
+    "help": lambda: _cmd_help(),
+    "清记忆": lambda group_id=None: _cmd_clear_history(group_id),
+    "clearmem": lambda group_id=None: _cmd_clear_history(group_id),
+}
+
+def _cmd_status(group_id: str|None=None) -> str:
+    hist_len=len(_chat_history.get(group_id or "",[]))
+    summ_info=_chat_summary.get(group_id or "")
+    summ_line=""
+    if summ_info:
+        summ_line=f"• 摘要: {len(summ_info[0])}字符\n"
+    return (
+        "📊 机器人状态\n"
+        f"• 群号: {','.join(ALLOWED_GROUPS) if ALLOWED_GROUPS else '不限'}\n"
+        f"• 管理员: {ADMIN_QQ}\n"
+        f"• 冷却: 群{COOLDOWN_GROUP_S}s / 用户{COOLDOWN_USER_S}s\n"
+        f"• Hermes: {HERMES_API_URL}\n"
+        f"• 对话记忆: {hist_len}条 (上限{MAX_HISTORY_STORE})\n"
+        f"{summ_line}"
+        f"• 最后一张图: {'有缓存' if _last_image_url else '无'}"
+    )
+
+def _cmd_lastimg() -> str:
+    if _last_image_url:
+        return f"📷 最近生成的图片:\n{_last_image_url}"
+    return "📷 还没有生成过图片"
+
+def _cmd_help() -> str:
+    return (
+        "🤖 管理员命令:\n"
+        "/状态 - 查看机器人状态\n"
+        "/查图 - 查看最近生成的图片\n"
+        "/清记忆 - 清空群聊对话记忆\n"
+        "/帮助 - 显示此消息"
+    )
+
+def _cmd_clear_history(group_id: str|None) -> str:
+    if group_id:
+        n=len(_chat_history.get(group_id,[]))
+        _chat_history[group_id]=[]
+        _chat_summary.pop(group_id,None)
+        return f"🧹 已清空本群 {n} 条对话记忆 + 摘要缓存"
+    return "🧹 没有可清理的对话记忆"
+
+async def handle_admin(bot: Bot, event: GroupMessageEvent, prompt: str) -> bool:
+    """Returns True if handled as admin command."""
+    cmd=prompt.strip().lstrip("/").lower()
+    for keyword, handler in ADMIN_COMMANDS.items():
+        if cmd==keyword.lower():
+            try:
+                result=handler()
+            except TypeError:
+                result=handler(group_id=str(event.group_id))
+            await send_chunks(bot, event, result)
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Main Handler
+# ═══════════════════════════════════════════════════════════════════
+
 @matcher.handle()
 async def handle(bot: Bot, event: GroupMessageEvent):
-    prompt = extract_prompt(event, str(event.self_id))
-    if not prompt:
-        return  # 没人 @，不处理
+    global _last_image_url
+    group_id=str(event.group_id)
 
-    # 检查冷却
-    cd = check_cooldown(group_id, user_id)
-    if cd:
-        await bot.send(event, cd)
+    if ALLOWED_GROUPS and group_id not in ALLOWED_GROUPS:
+        return
+    if BOT_QQ and str(event.user_id)==BOT_QQ:
         return
 
-    # 识别长任务，立刻告诉用户"在处理"
-    if any(kw in prompt for kw in ["部署", "安装", "构建", "下载"]):
-        await bot.send(event, "⏳ 收到，正在处理中，可能需要一些时间...")
+    prompt=extract_prompt(event, str(event.self_id))
+    if not prompt:
+        return
 
-    # 调用 Hermes
-    answer = await ask_hermes(prompt, group_id)
+    # Admin commands
+    if is_admin(str(event.user_id)):
+        if await handle_admin(bot, event, prompt):
+            return
 
-    # 分段发送（QQ 单条消息有长度限制）
-    for chunk in split_text(answer, 1800):
-        await bot.send(event, chunk)
+    # Cooldown
+    cd_msg=check_cooldown(group_id, str(event.user_id))
+    if cd_msg:
+        await bot.send(event, MessageSegment.reply(event.message_id)+cd_msg)
+        return
+
+    # Long task ack
+    is_long_task = any(kw in prompt for kw in ("部署","deploy","克隆","clone","安装","install","构建","build","下载","download"))
+    if is_long_task:
+        await bot.send(event, MessageSegment.reply(event.message_id)+"⏳ 收到，正在处理中，可能需要一些时间...")
+
+    try:
+        answer=await ask_hermes(prompt, group_id)
+    except Exception as e:
+        err_name=type(e).__name__
+        await bot.send(event, MessageSegment.reply(event.message_id)+f"❌ {err_name}，请稍后重试")
+        return
+
+    # Save to history
+    if group_id not in _chat_history:
+        _chat_history[group_id]=[]
+    _chat_history[group_id].append({"role":"user","content":prompt})
+    _chat_history[group_id].append({"role":"assistant","content":answer})
+    if len(_chat_history[group_id])>MAX_HISTORY_STORE:
+        _chat_history[group_id]=_chat_history[group_id][-MAX_HISTORY_STORE:]
+
+    # Image handling
+    if IMAGE_ONLY_ON_IMAGE_PROMPT and is_image_prompt(prompt):
+        url=first_image_url(answer)
+        if url:
+            _last_image_url=url
+            await bot.send(event, MessageSegment.reply(event.message_id)+MessageSegment.image(url))
+            return
+
+    # Plain text reply (with chunking)
+    clean=plain_qq_text(answer)
+    if len(clean)<=1800:
+        await bot.send(event, MessageSegment.reply(event.message_id)+clean)
+    else:
+        await send_chunks(bot, event, clean)
+PYEOF
 ```
 
-### 4.5 对话记忆（防遗忘）
+> 📏 总共 ~325 行，包含了：@触发、冷却、管理员命令、长回复分段、画图识别、**对话记忆+自动摘要**、长任务即时确认、错误兜底+重试。
 
-```python
-MAX_HISTORY = 100       # 最多存 100 条
-RECENT_WINDOW = 20      # 最近 20 条原文发给模型
-SUMMARY_TRIGGER = 10    # 每新增 10 条重新生成摘要
+### 代码功能速览
 
-_chat_history = {}   # {群号: [{role, content}, ...]}
-_chat_summary = {}   # {群号: "摘要文本"}
-
-async def build_messages(prompt, group_id):
-    history = _chat_history.get(group_id, [])
-    recent = history[-RECENT_WINDOW:]  # 最近 20 条原文
-    old = history[:-RECENT_WINDOW]     # 更早的压缩成摘要
-
-    # 定期自动摘要旧消息（调用 Hermes 自己生成）
-    if len(old) >= SUMMARY_TRIGGER:
-        await generate_summary(old, group_id)
-
-    messages = [{"role": "system", "content": system_prompt}]
-    if old:
-        messages.append({"role": "system", "content": f"[对话摘要] {_chat_summary[group_id]}"})
-    messages.extend(recent)
-    messages.append({"role": "user", "content": prompt})
-    return messages
-```
-
-> 🧠 **这样设计的好处**：最近的对话一字不差，更早的自动压缩。既不会忘事，也不浪费 token。
+| 功能 | 实现位置 | 说明 |
+|------|---------|------|
+| @触发 | `extract_prompt()` | 用 `raw_message` 检测，不怕格式变化 |
+| 冷却 | `check_cooldown()` | 群 3s，用户 10s |
+| 管理员命令 | `ADMIN_COMMANDS` | `/状态 /查图 /帮助 /清记忆` |
+| 长回复分段 | `send_chunks()` | 每段 ≤1800 字符，自动分条 |
+| 画图识别 | `is_image_prompt()` | 检测"画图/生图"等关键词 |
+| 对话记忆 | `_chat_history` + `_maybe_summarize()` | 存 100 条，超 20 条自动摘要 |
+| 长任务确认 | `handle()` 中 `is_long_task` | 部署/安装类先回"处理中" |
+| 超时 | `timeout=7200` | 2 小时，复杂任务不中断 |
+| 重试 | `ask_hermes()` 中 `retries` | 失败自动重试 2 次 |
 
 ---
 
