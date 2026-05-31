@@ -267,28 +267,23 @@ cat ~/napcat/config/onebot11_*.json | grep token
 
 ---
 
-## 🔑 第二步：配置 Hermes Agent API（容器内）
+## 🔑 第二步：确认 Hermes API 可用
 
-Hermes Agent 提供标准的 OpenAI 兼容 API，NoneBot2 通过这个 API 调用大模型。
-
-### 2.1 确保 Hermes Gateway 正在运行
+在第一步启动 Hermes 容器时，已经通过 `-e API_SERVER_KEY=...` 设置了 API 密钥。现在验证一下：
 
 ```bash
-# 在 Hermes 容器内执行
-curl http://127.0.0.1:8642/v1/health
-# 应该返回 {"status":"ok"}
+# 检查健康
+curl -s http://127.0.0.1:8642/v1/health
+# → {"status":"ok"}
+
+# 用 API Key 测试调用
+curl -s http://127.0.0.1:8642/v1/chat/completions \
+  -H "Authorization: Bearer 你的API_SERVER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-### 2.2 创建 API Key
-
-编辑 Hermes 配置文件（通常在 `config.yaml`）：
-
-```yaml
-gateway:
-  api_key: "你的API密钥"  # 自己设一个，NoneBot2 要用
-```
-
-如果你想用别的模型提供商，在 Hermes 里配好 provider（OpenRouter / DeepSeek / Anthropic 等），Hermes 会自动路由。
+记好你的 `API_SERVER_KEY`，下一步 NoneBot2 要用。
 
 ---
 
@@ -296,24 +291,32 @@ gateway:
 
 NoneBot2 是 Python 写的 QQ 机器人框架，我们用它接收 QQ 消息并转发给 Hermes。
 
-### 3.1 创建项目目录
+> 💡 以下命令全部在 **Hermes 容器内**执行。先进容器：`docker exec -it hermes bash`
+
+### 3.1 创建目录结构
 
 ```bash
+# 进容器
+docker exec -it hermes bash
+
+# 创建工作目录
 mkdir -p /opt/data/qq-bot/plugins
 mkdir -p /opt/data/qq-bot/prompts
+mkdir -p /opt/data/qq-bot/state
 cd /opt/data/qq-bot
 ```
 
 ### 3.2 安装依赖
 
 ```bash
-# 用 uv（推荐）或 pip
+# 用 uv 安装（Hermes 容器自带）
 uv pip install nonebot2 nonebot-adapter-onebot httpx pyyaml
 ```
 
 ### 3.3 创建启动文件 `bot.py`
 
-```python
+```bash
+cat > bot.py << 'PYEOF'
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter as ONEBOT_V11Adapter
 
@@ -324,22 +327,25 @@ nonebot.load_plugins("plugins")
 
 if __name__ == "__main__":
     nonebot.run()
+PYEOF
 ```
 
-### 3.4 创建环境变量配置文件
+### 3.4 创建环境变量 `.env`
 
-> 💡 `.env` 文件存敏感信息，不要提交到 Git。
-
-```
+```bash
+cat > .env << 'ENVEOF'
 HERMES_API_URL=http://127.0.0.1:8642/v1/chat/completions
-HERMES_QQ_ALLOWED_GROUPS=142766765
-HERMES_QQ_BOT_QQ=你的机器人QQ
-HERMES_QQ_ADMIN_QQ=你的QQ(管理员)
+HERMES_API_KEY=你在第零步设的API_SERVER_KEY
+HERMES_QQ_ALLOWED_GROUPS=你的群号
+HERMES_QQ_BOT_QQ=机器人QQ号
+HERMES_QQ_ADMIN_QQ=你的QQ号(管理员)
+ENVEOF
 ```
 
 ### 3.5 创建系统提示词 `prompts/niku.txt`
 
-```text
+```bash
+cat > prompts/niku.txt << 'TXLEOF'
 你是一个在 QQ 群里帮助用户的 AI 助手。请遵循以下原则：
 
 1. 默认使用中文回复
@@ -348,7 +354,46 @@ HERMES_QQ_ADMIN_QQ=你的QQ(管理员)
 4. 如果被问及 API 状态或服务状态，如实回答
 5. 不知道就说不知道，不要编造
 6. 友好但不过度热情
+TXLEOF
 ```
+
+### 3.6 创建 `pyproject.toml`
+
+```bash
+cat > pyproject.toml << 'TOMLEOF'
+[project]
+name = "qq-bot"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "nonebot2",
+    "nonebot-adapter-onebot",
+    "httpx",
+    "pyyaml",
+]
+TOMLEOF
+```
+
+### 3.7 验证目录结构
+
+```bash
+tree /opt/data/qq-bot
+```
+
+应该看到：
+
+```
+/opt/data/qq-bot/
+├── bot.py
+├── .env
+├── pyproject.toml
+├── plugins/
+├── prompts/
+│   └── niku.txt
+└── state/
+```
+
+> ✅ 项目骨架搭好了，接下来写核心插件。
 
 ---
 
