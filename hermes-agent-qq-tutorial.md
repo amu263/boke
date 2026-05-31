@@ -234,36 +234,30 @@ URL：ws://你的Hermes容器IP:8080/onebot/v11/ws
 
 保存后 NapCat 会尝试连接，此时还没人接——等后面 NoneBot2 跑起来就好了。
 
-### 1.4 登录 QQ 与查看令牌
+### 1.4 获取 WebUI 登录口令（Token）
 
-如果你用的是扫码登录，NapCat WebUI 首页会显示一个二维码。用机器人 QQ 号扫码登录即可。
-
-**查看登录令牌（Token）**：
-
-登录成功后，令牌保存在容器内的配置文件中。两种方式查看：
-
-**方式一：通过 WebUI（推荐）**
-
-打开 `http://你的IP:6099/webui` → **网络配置**，在 HTTP 服务配置里能看到 `access_token`（用于 NoneBot / HTTP API 调用）。
-
-**方式二：命令行**
+NapCat 第一次运行时，会在日志里打印一个**一次性登录口令**。打开 WebUI 时必须填写它。
 
 ```bash
-# 进入 NapCat 容器
-docker exec -it napcat sh
-
-# 令牌在 onebot11 配置里
-cat /app/napcat/config/onebot11_你的QQ号.json | grep token
+# 查看 NapCat 容器日志，找到 token
+docker logs napcat 2>&1 | grep -i "token\|密码\|WebUI\|登录"
 ```
 
-**方式三：宿主机直接看**
+你会看到类似这样的输出：
 
-```bash
-# 因为你映射了配置目录
-cat ~/napcat/config/onebot11_*.json | grep token
+```
+WebUI 登录 Token: a1b2c3d4e5f6
 ```
 
-> 💡 这个 token 是 NapCat HTTP API 的认证令牌，如果你需要通过 HTTP（而非 WebSocket）调用 NapCat API，就需要它。NoneBot2 用的是 WebSocket 方式，一般不需要这个 token。
+打开浏览器访问 `http://你的宿主机IP:6099/webui`，在登录页输入这个 Token 就能进入管理后台。
+
+> 💡 如果日志太多找不到，用 `docker logs napcat 2>&1 | head -100` 看前 100 行。Token 只在**首次启动**时打印，如果错过了，删掉容器重建：`docker rm -f napcat && docker run -d ...`（数据在挂载目录里不会丢）。
+
+### 1.5 登录 QQ
+
+进入 WebUI 后，首页会显示一个二维码。用**机器人 QQ 号**扫码即可登录。
+
+> ⚠️ 不要用自己的主号扫码，会被封。用专门注册的机器人小号。
 
 ---
 
