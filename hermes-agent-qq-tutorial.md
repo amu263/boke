@@ -809,61 +809,54 @@ grep "load plugin" nonebot.log
 
 ---
 
-## 🔧 第七步：生产级功能
+## 🔧 第七步：日常使用与维护
 
-### 7.1 冷却机制
+所有生产级功能已经在第四步的插件代码里内置好了。这里告诉你**怎么用**。
 
-```python
-COOLDOWN_GROUP_S = 3   # 群冷却 3 秒
-COOLDOWN_USER_S = 10   # 每人冷却 10 秒
-```
+### 7.1 管理员命令（只有你能用）
 
-防止刷屏和 API 费用爆炸。
+在群里 @机器人 发以下命令（必须是你在 `.env` 里设的 `HERMES_QQ_ADMIN_QQ`）：
 
-### 7.2 管理员命令
-
-| 命令 | 功能 |
+| 命令 | 效果 |
 |------|------|
-| `/状态` | 查看运行状态、记忆数 |
-| `/查图` | 最近生成的图片链接 |
-| `/清记忆` | 清空群聊对话历史 |
-| `/帮助` | 显示所有命令 |
+| `@机器人 /状态` | 看机器人运行状态、记忆条数 |
+| `@机器人 /查图` | 最近生成的图片链接 |
+| `@机器人 /清记忆` | 清空本群对话记忆（它"失忆"了） |
+| `@机器人 /帮助` | 显示所有命令 |
 
-### 7.3 自动重启
+### 7.2 保活（崩溃自动重启）
 
-用 systemd 或 supervisor 保活：
-
-```ini
-# /etc/systemd/system/qq-bot.service
-[Unit]
-Description=QQ Bot (NoneBot2)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/data/qq-bot
-ExecStart=/opt/data/qq-bot/.venv/bin/python bot.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
+在 `docker run` 时已经加了 `--restart unless-stopped`，容器崩溃或宿主机重启后 Docker 会自动拉起来。不需要额外配置 systemd。
 
 ```bash
-systemctl enable qq-bot --now
+# 确认保活已开启
+docker inspect hermes | grep -A1 RestartPolicy
+# 看到 "Name": "unless-stopped" 就对了
 ```
 
-### 7.4 每日群聊总结
-
-在 `crontab -e` 里加上：
+### 7.3 查看运行状态
 
 ```bash
-0 22 * * * curl -s "http://127.0.0.1:8642/v1/api/chat/completions" \
-  -H "Authorization: Bearer $HERMES_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"总结今天群里的聊天内容，不超过500字"}]}'
+# 看实时日志
+docker logs -f hermes
+
+# 进容器看 NoneBot2 日志
+docker exec hermes tail -f /opt/data/qq-bot/nonebot.log
+
+# 检查 API 健康
+curl -s http://127.0.0.1:8642/v1/health
 ```
+
+### 7.4 修改配置后重启
+
+```bash
+# 改了 .env 或插件代码后
+docker exec hermes bash -c "pkill -f bot.py; sleep 1; cd /opt/data/qq-bot && python bot.py &"
+# 或者干脆重启容器
+docker restart hermes
+```
+
+> 💡 NapCat 会自动重连，等约 30 秒就恢复。
 
 ---
 
