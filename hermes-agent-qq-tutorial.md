@@ -40,13 +40,13 @@
 
 ### 你需要知道的信息
 
-| 项目 | 示例值 | 怎么获取 |
-|------|--------|---------|
-| 机器人 QQ 号 | `3999365644` | 你的机器人小号 |
-| 目标群号 | `142766765` | 群聊设置里看 |
-| 你的 QQ 号 | `3471905205` | 管理员用 |
-| 容器 IP | `172.17.0.5` | 进容器后 `hostname -I` |
-| 宿主机 IP | `192.168.2.10` | `ip addr` 看局域网 IP |
+| 项目 | 怎么获取 |
+|------|---------|
+| 机器人 QQ 号 | 注册一个新的 QQ 号，专门给机器人用 |
+| 目标群号 | 打开群聊 → 群设置 → 群聊资料页最下方 |
+| 你的 QQ 号 | 你平时用的 QQ 号，管理员功能需要 |
+| Hermes 容器 IP | `docker exec hermes hostname -I` |
+| 宿主机 IP | `ip addr \| grep inet` 看局域网地址 |
 
 ---
 
@@ -124,8 +124,8 @@ docker run -d \
 curl -s http://127.0.0.1:8642/v1/health
 # → {"status":"ok"}
 
-# 从其他容器测试（假设 Hermes 容器 IP 为 172.17.0.5）
-curl -s http://172.17.0.5:8642/v1/health \
+# 从其他容器测试（Hermes 容器 IP 可通过 docker exec hermes hostname -I 查看）
+curl -s http://你的Hermes容器IP:8642/v1/health \
   -H "Authorization: Bearer 你的API_SERVER_KEY"
 ```
 
@@ -221,10 +221,10 @@ docker run -d \
 
 ```
 名称：NoneBot
-URL：ws://172.17.0.5:8080/onebot/v11/ws
+URL：ws://你的Hermes容器IP:8080/onebot/v11/ws
 ```
 
-> ⚠️ `172.17.0.5` 是你 Docker 容器的 IP。如果容器 IP 不同，改成实际的。
+> ⚠️ `你的Hermes容器IP` 通过 `docker exec hermes hostname -I` 获取。每次容器重启 IP 可能变化，建议用固定 IP 或 Docker 网络。
 
 ### 1.3 开启 HTTP 服务（给 NoneBot 用）
 
@@ -764,7 +764,7 @@ cd /opt/data/qq-bot
 
 ### 5.2 NapCat 自动连接
 
-NapCat 会不停尝试连接 `ws://172.17.0.5:8080/onebot/v11/ws`。NoneBot2 起来后，NapCat WebUI 里会显示：
+NapCat 会不停尝试连接 `ws://你的Hermes容器IP:8080/onebot/v11/ws`。NoneBot2 起来后，NapCat WebUI 里会显示：
 
 ```
 ✅ WebSocket Client: 已连接
@@ -883,7 +883,7 @@ ps aux | grep bot.py
 cat /proc/net/tcp | grep ':1F90'  # 1F90 是 8080 的十六进制
 
 # 3. 确认容器间网络互通（从容器里 ping 宿主机）
-ping 192.168.2.10
+ping 你的宿主机IP
 ```
 
 ### Q2: @机器人 没反应
