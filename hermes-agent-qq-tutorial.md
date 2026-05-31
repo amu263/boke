@@ -52,72 +52,146 @@
 
 ## 🐳 第零步：部署 Hermes Agent（Docker）
 
-Hermes Agent 是整个系统的大脑，负责调用大模型干活。
+Hermes Agent 是整个系统的大脑。官方提供 Docker 镜像，一行命令就能跑。
 
-### 0.1 克隆代码
+### 0.1 首次运行：创建数据目录 + 初始化配置
 
-```bash
-git clone https://github.com/NousResearch/hermes-agent.git
-cd hermes-agent
-```
-
-### 0.2 启动容器
+Hermes 的所有数据（配置、API Key、会话、技能）都存在宿主机 `~/.hermes/` 下，挂载进容器的 `/opt/data`。
 
 ```bash
-HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+# 创建数据目录
+mkdir -p ~/.hermes
+
+# 进入交互式初始化向导（配置 API Key、选择模型）
+docker run -it --rm \
+  -v ~/.hermes:/opt/data \
+  nousresearch/hermes-agent setup
 ```
 
-两个服务：
+> 💡 如果你用 Nous Portal 账号，容器里跑 `hermes setup --portal` 一次即可，登录 token 会持久化到 `~/.hermes/`。
 
-| 服务 | 端口 | 作用 |
-|------|------|------|
-| `hermes` (gateway) | `:8642` | API + 消息网关 |
-| `hermes-dashboard` | `:9119` | Web 面板 |
+### 0.2 以后台 Gateway 模式运行
 
-> 用 `network_mode: host`，容器共享宿主机网络。
-
-### 0.3 配置模型和 API Key
+配好 API Key 后，以后台服务方式跑：
 
 ```bash
-docker exec -it hermes hermes setup
+docker run -d \
+  --name hermes \
+  --restart unless-stopped \
+  -v ~/.hermes:/opt/data \
+  -p 8642:8642 \
+  nousresearch/hermes-agent gateway run
 ```
 
-或编辑 `~/.hermes/config.yaml`：
+| 参数 | 作用 |
+|------|------|
+| `-d` | 后台运行 |
+| `--restart unless-stopped` | 崩溃/重启后自动恢复 |
+| `-v ~/.hermes:/opt/data` | 挂载数据目录 |
+| `-p 8642:8642` | 暴露 API 端口给宿主机 |
+| `gateway run` | 启动消息网关 + API 服务 |
 
-```yaml
-model:
-  default: "deepseek-v4-pro"
-  provider: "deepseek"
+> 🔒 容器内 gateway 由 **s6-overlay** 自动守护——崩溃秒级重启，不掉容器。
 
-gateway:
-  api_key: "你自定义的密钥"   # NoneBot2 用这个调用 API
-```
+### 0.3 暴露 API 给外部调用（NoneBot2 需要）
 
-### 0.4 暴露 API（如果 NoneBot2 在另一容器）
-
-`docker-compose.yml` 取消注释：
-
-```yaml
-- API_SERVER_HOST=0.0.0.0
-- API_SERVER_KEY=你的密钥
-```
-
-重启：`docker compose restart`
-
-### 0.5 验证
+默认 API 只监听 `127.0.0.1`。要在其他容器调用，需设环境变量：
 
 ```bash
-docker exec hermes curl -s http://127.0.0.1:8642/v1/health
+docker run -d \
+  --name hermes \
+  --restart unless-stopped \
+  -v ~/.hermes:/opt/data \
+  -p 8642:8642 \
+  -e API_SERVER_ENABLED=true \
+  -e API_SERVER_HOST=0.0.0.0 \
+  -e API_SERVER_KEY="$(openssl rand -hex 32)" \
+  nousresearch/hermes-agent gateway run
+```
+
+| 环境变量 | 说明 |
+|----------|------|
+| `API_SERVER_ENABLED=true` | 开启 API 服务（必需） |
+| `API_SERVER_HOST=0.0.0.0` | 监听所有网卡 |
+| `API_SERVER_KEY=...` | API 认证密钥（≥8 字符） |
+
+> ⚠️ `API_SERVER_KEY` 就是 NoneBot2 调用 API 时用的 `HERMES_API_KEY`。用 `openssl rand -hex 32` 生成一个随机密钥，记下来。
+
+### 0.4 验证
+
+```bash
+# 检查健康状态
+curl -s http://127.0.0.1:8642/v1/health
 # → {"status":"ok"}
+
+# 从其他容器测试（假设 Hermes 容器 IP 为 172.17.0.5）
+curl -s http://172.17.0.5:8642/v1/health \
+  -H "Authorization: Bearer 你的API_SERVER_KEY"
+```
+
+### 0.5 Docker Compose 方式（可选）
+
+如果喜欢 Compose 管理，建一个 `docker-compose.yml`：
+
+```yaml
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+    ports:
+      - "8642:8642"
+    volumes:
+      - ~/.hermes:/opt/data
+    environment:
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${API_SERVER_KEY}
+```
+
+```bash
+API_SERVER_KEY="你的密钥" docker compose up -d
 ```
 
 ### 0.6 常用命令
 
 ```bash
-docker logs -f hermes        # 看日志
-docker exec -it hermes bash  # 进容器
-docker compose restart       # 重启
-docker compose down          # 停止
+docker logs -f hermes            # 实时日志
+docker exec -it hermes bash      # 进入容器
+docker exec hermes hermes setup  # 重新配置
+docker restart hermes            # 重启
+docker rm -f hermes              # 删除容器（数据在 ~/.hermes 不受影响）
+```
+
+### 0.7 挂 Dashboard（可选）
+
+如果想让宿主机访问 Web 管理面板：
+
+```bash
+docker run -d \
+  --name hermes \
+  --restart unless-stopped \
+  -v ~/.hermes:/opt/data \
+  -p 8642:8642 \
+  -p 9119:9119 \
+  -e HERMES_DASHBOARD=1 \
+  -e API_SERVER_ENABLED=true \
+  -e API_SERVER_HOST=0.0.0.0 \
+  -e API_SERVER_KEY="你的密钥" \
+  nousresearch/hermes-agent gateway run
+```
+
+打开 `http://宿主机IP:9119` 就能看到仪表盘。
+
+> ❗ Dashboard 暴露 API Key，不要开在公网。生产环境走 SSH 隧道或反向代理加认证。
+
+### 0.8 升级
+
+```bash
+docker pull nousresearch/hermes-agent:latest
+docker rm -f hermes
+# 重新执行 0.2 的 docker run 命令（数据在 ~/.hermes，不会丢）
 ```
 
 ---
